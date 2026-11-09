@@ -1,0 +1,8 @@
+source:
+  name: godaddy
+  base_url: https://inventory.auctions.godaddy.com/
+  metadata_file: metadata.json
+
+  target_files:
+    - all_biddable_auctions.json.zip
+    - closeout_listings.json.zip
