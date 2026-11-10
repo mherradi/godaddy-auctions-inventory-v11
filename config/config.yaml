@@ -1,3 +1,4 @@
+
 source:
   name: godaddy
   base_url: https://inventory.auctions.godaddy.com/
@@ -6,3 +7,9 @@ source:
   target_files:
     - all_biddable_auctions.json.zip
     - closeout_listings.json.zip
+
+storage:
+  bucket: godaddy-auctions-v11-data-49757842710
+  raw_prefix: raw/snapshots
+  processed_prefix: processed/snapshots
+  transformed_prefix: transformed/snapshots

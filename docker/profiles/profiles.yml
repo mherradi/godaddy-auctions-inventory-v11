@@ -1,0 +1,11 @@
+godaddy_auctions_dbt:
+  target: prod
+  outputs:
+    prod:
+      type: bigquery
+      method: oauth
+      project: godaddy-auctions-inventory-v11
+      dataset: godaddy_auctions_dbt
+      location: europe-west9
+      threads: 4
+      priority: interactive

@@ -1,7 +1,27 @@
+
+"""
+Transform GoDaddy inventory JSON files into standardized Parquet.
+
+Inputs:
+    gs://<bucket>/processed/snapshots/YYYY-MM-DD/
+
+Outputs:
+    gs://<bucket>/transformed/snapshots/YYYY-MM-DD/
+        stg_auction_inventory.parquet
+        transformation_report.json
+
+Run from the project root:
+    python -m collect.transform --snapshot-date YYYY-MM-DD
+"""
+
+import argparse
 import json
 import logging
 import re
+import sqlite3
 import sys
+import tempfile
+
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -10,34 +30,18 @@ from urllib.parse import urlparse
 import ijson
 import pyarrow as pa
 import pyarrow.parquet as pq
+import yaml
+
+from google.cloud import storage
 
 
 # ============================================================
 # 1. PROJECT PATHS AND CONFIGURATION
 # ============================================================
 
-# File location:
-# project_root/collect/transform/transform.py
-#
-# parents[0] = collect/transform
-# parents[1] = collect
-# parents[2] = project root
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-INPUT_DIR = PROJECT_ROOT / "data" / "processed"
-OUTPUT_DIR = PROJECT_ROOT / "data" / "transformed"
-
-DISCOVERY_MANIFEST = (
-    PROJECT_ROOT
-    / "collect"
-    / "discovery"
-    / "discovery_manifest.json"
-)
-
-OUTPUT_FILE = OUTPUT_DIR / "stg_auction_inventory.parquet"
-TEMP_OUTPUT_FILE = OUTPUT_DIR / "stg_auction_inventory.tmp.parquet"
-REPORT_FILE = OUTPUT_DIR / "transformation_report.json"
+# This script is located at project_root/collect/transform.py.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
 BATCH_SIZE = 10_000
 MAX_ERROR_EXAMPLES = 100
@@ -65,9 +69,7 @@ DATASETS = [
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 
 logger = logging.getLogger(__name__)
@@ -101,101 +103,85 @@ SCHEMA = pa.schema([
 
 
 # ============================================================
-# 4. METADATA LOOKUP
+# 4. CONFIGURATION AND GCS HELPERS
 # ============================================================
 
-def normalize_filename(filename):
-    """
-    Normalize filenames so that:
-        inventory.json
-        inventory.json.zip
+def load_config():
+    """Load project configuration."""
 
-    are treated as the same inventory file.
-    """
+    with CONFIG_PATH.open("r", encoding="utf-8") as file:
+        config = yaml.safe_load(file)
 
-    filename = Path(filename).name.lower()
-
-    if filename.endswith(".zip"):
-        filename = filename[:-4]
-
-    return filename
-
-
-def find_source_last_modified(file_name):
-    """
-    Find the source file's last_modified timestamp
-    in discovery_manifest.json.
-
-    Supports both .json and .json.zip filenames.
-    """
-
-    if not DISCOVERY_MANIFEST.exists():
-        raise FileNotFoundError(
-            f"Discovery manifest not found: {DISCOVERY_MANIFEST}"
+    if not isinstance(config, dict):
+        raise ValueError(
+            "Configuration file must contain a YAML mapping."
         )
 
-    with open(
-        DISCOVERY_MANIFEST,
-        "r",
-        encoding="utf-8"
-    ) as file:
+    if "storage" not in config:
+        raise ValueError(
+            "Missing storage configuration in config.yaml."
+        )
 
-        manifest = json.load(file)
+    return config
 
-    requested_name = normalize_filename(file_name)
 
-    selected_files = manifest.get("selected_files", [])
+def utc_now():
+    """Return the current UTC timestamp."""
 
-    for entry in selected_files:
+    return datetime.now(timezone.utc)
 
-        manifest_name = entry.get("file_name", "")
 
-        if normalize_filename(manifest_name) == requested_name:
+def upload_json(bucket, object_name, payload):
+    """Upload a JSON report to GCS."""
 
-            last_modified = entry.get("last_modified")
+    blob = bucket.blob(object_name)
 
-            if not last_modified:
-                raise ValueError(
-                    f"File found in manifest, but last_modified "
-                    f"is missing: {manifest_name}"
-                )
-
-            return last_modified
-
-    raise ValueError(
-        f"No matching file found in discovery manifest for: "
-        f"{file_name}"
+    blob.upload_from_string(
+        json.dumps(
+            payload,
+            indent=4,
+            ensure_ascii=False,
+            default=str,
+        ),
+        content_type="application/json",
     )
 
 
-def get_snapshot_date(file_name):
-    """
-    Convert the source last_modified timestamp into a UTC date.
+def load_discovery_manifest(bucket, object_name):
+    """Load and validate the discovery manifest."""
 
-    This uses GoDaddy's manifest last_modified value as the
-    snapshot-date proxy. It does not use the transformation
-    execution date.
-    """
+    blob = bucket.get_blob(object_name)
 
-    last_modified = find_source_last_modified(file_name)
-
-    try:
-        timestamp = datetime.fromisoformat(
-            last_modified.replace("Z", "+00:00")
+    if blob is None:
+        raise FileNotFoundError(
+            f"Discovery manifest not found: "
+            f"gs://{bucket.name}/{object_name}"
         )
 
-        if timestamp.tzinfo is None:
-            raise ValueError(
-                f"Timestamp has no timezone: {last_modified}"
-            )
+    manifest = json.loads(blob.download_as_text())
 
-        return timestamp.astimezone(timezone.utc).date()
+    expected_archives = {
+        "all_biddable_auctions.json.zip",
+        "closeout_listings.json.zip",
+    }
 
-    except (ValueError, TypeError) as error:
+    selected_files = manifest.get("selected_files", [])
+
+    discovered_archives = {
+        item.get("file_name")
+        for item in selected_files
+        if isinstance(item, dict)
+    }
+
+    missing_datasets = expected_archives - discovered_archives
+
+    if missing_datasets:
         raise ValueError(
-            f"Invalid last_modified timestamp for {file_name}: "
-            f"{last_modified}"
-        ) from error
+            "Discovery manifest is missing expected archives: "
+            + ", ".join(sorted(missing_datasets))
+        )
+
+    return manifest
 
 
 # ============================================================
@@ -234,21 +220,12 @@ def normalize_domain(domain_name):
 
 
 def parse_listing_id(listing_url):
-    """
-    Extract the numeric GoDaddy listing ID from the URL.
-
-    Example:
-    https://www.godaddy.com/domain-auctions/example-com-123456789
-
-    Returns:
-        123456789
-    """
+    """Extract the numeric GoDaddy listing ID from its URL."""
 
     if not isinstance(listing_url, str):
         raise ValueError("Listing URL must be a string.")
 
     parsed_url = urlparse(listing_url.strip())
-
     hostname = (parsed_url.hostname or "").lower()
 
     valid_host = (
@@ -269,7 +246,6 @@ def parse_listing_id(listing_url):
         )
 
     final_path_segment = path_parts[-1]
-
     match = re.search(r"-(\d+)$", final_path_segment)
 
     if not match:
@@ -285,16 +261,7 @@ def parse_listing_id(listing_url):
 # ============================================================
 
 def parse_currency(value, field_name, required=False):
-    """
-    Convert currency strings such as:
-        '$1'
-        '$1,323'
-        '$0'
-
-    into Decimal values.
-
-    Missing optional values become None.
-    """
+    """Convert currency strings into Decimal values."""
 
     if value is None or value == "":
         if required:
@@ -333,12 +300,7 @@ def parse_currency(value, field_name, required=False):
 
 
 def parse_integer(value, field_name, required=False):
-    """
-    Convert integer-like values to Python integers.
-
-    Decimal values are accepted only when they represent
-    whole numbers.
-    """
+    """Convert integer-like values to non-negative integers."""
 
     if value is None or value == "":
         if required:
@@ -358,6 +320,7 @@ def parse_integer(value, field_name, required=False):
                 raise ValueError(
                     f"Non-integer value for {field_name}: {value}"
                 )
+
             result = int(value)
 
         elif isinstance(value, int):
@@ -386,12 +349,7 @@ def parse_integer(value, field_name, required=False):
 
 
 def parse_timestamp(value):
-    """
-    Parse an ISO timestamp and convert it to UTC.
-
-    Example:
-        2026-11-08T16:00:00Z
-    """
+    """Parse an ISO timestamp and convert it to UTC."""
 
     if not isinstance(value, str) or not value.strip():
         raise ValueError(
@@ -417,9 +375,7 @@ def parse_timestamp(value):
 
 
 def parse_boolean(value, field_name):
-    """
-    Accept boolean values and preserve missing values as None.
-    """
+    """Validate boolean values and preserve missing values as None."""
 
     if value is None:
         return None
@@ -440,12 +396,12 @@ def transform_record(
     record,
     settings,
     snapshot_date,
-    ingested_at
+    ingested_at,
 ):
-    """
-    Transform one raw GoDaddy inventory record into
-    the standardized staging schema.
-    """
+    """Transform one raw record into the standardized schema."""
+
+    if not isinstance(record, dict):
+        raise ValueError("Expected a JSON object.")
 
     domain_name = record.get("domainName")
 
@@ -480,38 +436,38 @@ def transform_record(
         "price": parse_currency(
             record.get("price"),
             "price",
-            required=True
+            required=True,
         ),
 
         "valuation": parse_currency(
             record.get("valuation"),
-            "valuation"
+            "valuation",
         ),
 
         "monthly_parking_revenue": parse_currency(
             record.get("monthlyParkingRevenue"),
-            "monthlyParkingRevenue"
+            "monthlyParkingRevenue",
         ),
 
         "number_of_bids": parse_integer(
             record.get("numberOfBids"),
             "numberOfBids",
-            required=True
+            required=True,
         ),
 
         "domain_age": parse_integer(
             record.get("domainAge"),
-            "domainAge"
+            "domainAge",
         ),
 
         "pageviews": parse_integer(
             record.get("pageviews"),
-            "pageviews"
+            "pageviews",
         ),
 
         "is_adult": parse_boolean(
             record.get("isAdult"),
-            "isAdult"
+            "isAdult",
         ),
 
         # Technical lineage fields
@@ -530,43 +486,118 @@ def transform_record(
 
 
 # ============================================================
-# 8. DATASET TRANSFORMATION
+# 8. QUALITY CHECKS
+# ============================================================
+
+def create_quality_database(database_path):
+    """
+    Create temporary SQLite tables for duplicate checks.
+
+    Domain names and listing IDs are checked across both datasets.
+    """
+
+    connection = sqlite3.connect(database_path)
+
+    connection.execute("""
+        CREATE TABLE quality_keys (
+            domain_name_normalized TEXT PRIMARY KEY,
+            listing_id TEXT NOT NULL UNIQUE,
+            source_dataset TEXT NOT NULL
+        )
+    """)
+
+    connection.commit()
+
+    return connection
+
+
+def validate_unique_record(connection, transformed_record):
+    """Reject duplicate normalized domains or listing IDs."""
+
+    try:
+        connection.execute(
+            """
+            INSERT INTO quality_keys (
+                domain_name_normalized,
+                listing_id,
+                source_dataset
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                transformed_record["domain_name_normalized"],
+                transformed_record["listing_id"],
+                transformed_record["source_dataset"],
+            ),
+        )
+
+    except sqlite3.IntegrityError as error:
+        raise ValueError(
+            "Duplicate domain or listing ID detected: "
+            f"{transformed_record['domain_name_normalized']} / "
+            f"{transformed_record['listing_id']}"
+        ) from error
+
+
+# ============================================================
+# 9. DATASET TRANSFORMATION
 # ============================================================
 
 def process_dataset(
     writer,
+    bucket,
+    temporary_dir,
+    processed_prefix,
     settings,
     snapshot_date,
     ingested_at,
-    report
+    quality_connection,
+    report,
 ):
-    """
-    Stream one JSON dataset and write transformed records
-    to the Parquet writer in batches.
-    """
+    """Download, stream, validate and transform one dataset."""
 
-    input_file = INPUT_DIR / settings["file"]
+    filename = settings["file"]
 
-    if not input_file.exists():
+    input_object = (
+        f"{processed_prefix.rstrip('/')}/{filename}"
+    )
+
+    input_blob = bucket.get_blob(input_object)
+
+    if input_blob is None:
         raise FileNotFoundError(
-            f"Input dataset not found: {input_file}"
+            f"Input dataset not found: "
+            f"gs://{bucket.name}/{input_object}"
         )
 
+    input_file = Path(temporary_dir) / filename
+
     logger.info("----------------------------------")
-    logger.info("Processing dataset: %s", settings["file"])
+    logger.info("Processing dataset: %s", filename)
     logger.info("Snapshot date: %s", snapshot_date)
-    logger.info("Input file: %s", input_file)
+    logger.info("GCS input: %s", input_object)
+
+    input_blob.download_to_filename(str(input_file))
+
+    logger.info(
+        "Downloaded %s (%s bytes)",
+        filename,
+        input_file.stat().st_size,
+    )
 
     dataset_report = {
+        "input_object": input_object,
+        "input_size_bytes": input_file.stat().st_size,
         "records_read": 0,
         "records_written": 0,
         "records_rejected": 0,
+        "duplicate_domain_or_listing_id": 0,
         "errors": [],
     }
 
     batch = []
 
-    with open(input_file, "rb") as source:
+    with input_file.open("rb") as source:
 
         records = ijson.items(source, "data.item")
 
@@ -582,11 +613,21 @@ def process_dataset(
                     ingested_at=ingested_at,
                 )
 
+                validate_unique_record(
+                    quality_connection,
+                    transformed_record,
+                )
+
                 batch.append(transformed_record)
 
             except Exception as error:
 
                 dataset_report["records_rejected"] += 1
+
+                if "Duplicate domain or listing ID" in str(error):
+                    dataset_report[
+                        "duplicate_domain_or_listing_id"
+                    ] += 1
 
                 if len(dataset_report["errors"]) < MAX_ERROR_EXAMPLES:
                     dataset_report["errors"].append({
@@ -598,7 +639,7 @@ def process_dataset(
 
                 table = pa.Table.from_pylist(
                     batch,
-                    schema=SCHEMA
+                    schema=SCHEMA,
                 )
 
                 writer.write_table(table)
@@ -610,17 +651,17 @@ def process_dataset(
                 logger.info(
                     "%s | Read: %s | Written: %s | Rejected: %s",
                     settings["source_dataset"],
-                    dataset_report["records_read"],
-                    dataset_report["records_written"],
-                    dataset_report["records_rejected"],
+                    f"{dataset_report['records_read']:,}",
+                    f"{dataset_report['records_written']:,}",
+                    f"{dataset_report['records_rejected']:,}",
                 )
 
-    # Write the remaining records in the final batch.
+    # Write the remaining records.
     if batch:
 
         table = pa.Table.from_pylist(
             batch,
-            schema=SCHEMA
+            schema=SCHEMA,
         )
 
         writer.write_table(table)
@@ -629,192 +670,287 @@ def process_dataset(
 
         batch.clear()
 
+    quality_connection.commit()
+
     report["datasets"][settings["source_dataset"]] = dataset_report
 
     logger.info(
         "Completed %s | Read: %s | Written: %s | Rejected: %s",
         settings["source_dataset"],
-        dataset_report["records_read"],
-        dataset_report["records_written"],
-        dataset_report["records_rejected"],
+        f"{dataset_report['records_read']:,}",
+        f"{dataset_report['records_written']:,}",
+        f"{dataset_report['records_rejected']:,}",
     )
+
+    # Remove the downloaded JSON after processing this dataset.
+    input_file.unlink()
 
     return dataset_report
 
 
 # ============================================================
-# 9. REPORT GENERATION
+# 10. REPORT GENERATION
 # ============================================================
 
-def write_report(report):
-    """
-    Write transformation_report.json.
-    """
+def write_report(bucket, report_object, report):
+    """Upload the transformation report to GCS."""
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    with open(
-        REPORT_FILE,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            report,
-            file,
-            indent=4,
-            default=str
-        )
+    upload_json(
+        bucket,
+        report_object,
+        report,
+    )
 
 
 # ============================================================
-# 10. MAIN PIPELINE
+# 11. MAIN PIPELINE
 # ============================================================
 
 def main():
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(
+        description="Transform GoDaddy inventory JSON into Parquet."
+    )
 
-    ingested_at = datetime.now(timezone.utc)
+    parser.add_argument(
+        "--snapshot-date",
+        required=True,
+        help="Collection snapshot date in YYYY-MM-DD format.",
+    )
+
+    args = parser.parse_args()
+
+    snapshot_date = date.fromisoformat(
+        args.snapshot_date
+    )
+
+    ingested_at = utc_now()
+
+    config = load_config()
+    storage_config = config["storage"]
+
+    bucket_name = storage_config["bucket"]
+
+    processed_prefix = storage_config.get(
+        "processed_prefix",
+        "processed/snapshots",
+    ).strip("/")
+
+    transformed_prefix = storage_config.get(
+        "transformed_prefix",
+        "transformed/snapshots",
+    ).strip("/")
+
+    processed_snapshot_prefix = (
+        f"{processed_prefix}/{snapshot_date.isoformat()}"
+    )
+
+    transformed_snapshot_prefix = (
+        f"{transformed_prefix}/{snapshot_date.isoformat()}"
+    )
+
+    discovery_manifest_object = (
+        f"{processed_snapshot_prefix}/../discovery_manifest.json"
+    )
+
+    # Discovery manifest actually lives in raw, not processed.
+    raw_prefix = storage_config.get(
+        "raw_prefix",
+        "raw/snapshots",
+    ).strip("/")
+
+    discovery_manifest_object = (
+        f"{raw_prefix}/{snapshot_date.isoformat()}/"
+        "discovery_manifest.json"
+    )
+
+    output_object = (
+        f"{transformed_snapshot_prefix}/"
+        "stg_auction_inventory.parquet"
+    )
+
+    report_object = (
+        f"{transformed_snapshot_prefix}/"
+        "transformation_report.json"
+    )
 
     report = {
+        "source": "godaddy",
+        "snapshot_date": snapshot_date.isoformat(),
         "generated_at_utc": ingested_at.isoformat(),
         "status": "running",
-        "input_directory": str(INPUT_DIR),
-        "output_file": str(OUTPUT_FILE),
+        "input_prefix": processed_snapshot_prefix,
+        "output_object": output_object,
         "datasets": {},
         "total_records_read": 0,
         "total_records_written": 0,
         "total_records_rejected": 0,
+        "quality_checks": {},
         "errors": [],
     }
-
-    writer = None
-    transformation_succeeded = False
 
     logger.info("==================================")
     logger.info("GODADDY INVENTORY TRANSFORMATION")
     logger.info("==================================")
-
     logger.info("Project root: %s", PROJECT_ROOT)
-    logger.info("Input directory: %s", INPUT_DIR)
-    logger.info("Output directory: %s", OUTPUT_DIR)
-    logger.info("Discovery manifest: %s", DISCOVERY_MANIFEST)
+    logger.info("Snapshot date: %s", snapshot_date)
+    logger.info("GCS input: %s", processed_snapshot_prefix)
+    logger.info("GCS output: %s", output_object)
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+
+    writer = None
+    quality_connection = None
+    transformation_succeeded = False
 
     try:
 
         # ----------------------------------------------------
-        # Check project inputs
+        # Validate discovery manifest
         # ----------------------------------------------------
 
-        if not INPUT_DIR.exists():
-            raise FileNotFoundError(
-                f"Input directory does not exist: {INPUT_DIR}"
-            )
-
-        if not DISCOVERY_MANIFEST.exists():
-            raise FileNotFoundError(
-                f"Discovery manifest does not exist: "
-                f"{DISCOVERY_MANIFEST}"
-            )
-
-        # ----------------------------------------------------
-        # Remove an abandoned temporary file from an earlier
-        # failed run. The final output file is not touched.
-        # ----------------------------------------------------
-
-        if TEMP_OUTPUT_FILE.exists():
-            TEMP_OUTPUT_FILE.unlink()
-
-        # ----------------------------------------------------
-        # Initialize Parquet writer
-        # ----------------------------------------------------
-
-        writer = pq.ParquetWriter(
-            TEMP_OUTPUT_FILE,
-            SCHEMA,
-            compression="snappy",
+        manifest = load_discovery_manifest(
+            bucket,
+            discovery_manifest_object,
         )
 
+        report["discovery_manifest"] = discovery_manifest_object
+
         # ----------------------------------------------------
-        # Process each dataset
+        # Temporary local workspace
         # ----------------------------------------------------
 
-        for settings in DATASETS:
+        with tempfile.TemporaryDirectory(
+            prefix="godaddy_transform_",
+            ignore_cleanup_errors=True,
+        ) as temporary_dir:
+
+            database_path = (
+                Path(temporary_dir) / "quality_checks.sqlite"
+            )
+
+            parquet_path = (
+                Path(temporary_dir) / "stg_auction_inventory.parquet"
+            )
+
+            quality_connection = create_quality_database(
+                database_path
+            )
+
+            # ------------------------------------------------
+            # Initialize Parquet writer
+            # ------------------------------------------------
+
+            writer = pq.ParquetWriter(
+                parquet_path,
+                SCHEMA,
+                compression="snappy",
+            )
+
+            # ------------------------------------------------
+            # Process both datasets
+            # ------------------------------------------------
+
+            for settings in DATASETS:
+
+                dataset_report = process_dataset(
+                    writer=writer,
+                    bucket=bucket,
+                    temporary_dir=temporary_dir,
+                    processed_prefix=processed_snapshot_prefix,
+                    settings=settings,
+                    snapshot_date=snapshot_date,
+                    ingested_at=ingested_at,
+                    quality_connection=quality_connection,
+                    report=report,
+                )
+
+                report["total_records_read"] += (
+                    dataset_report["records_read"]
+                )
+
+                report["total_records_written"] += (
+                    dataset_report["records_written"]
+                )
+
+                report["total_records_rejected"] += (
+                    dataset_report["records_rejected"]
+                )
+
+            # --------------------------------------------
+            # Close writer before validating Parquet output
+            # --------------------------------------------
+
+            writer.close()
+            writer = None
+
+            quality_connection.close()
+            quality_connection = None
+
+            # ------------------------------------------------
+            # Integrated quality checks
+            # ------------------------------------------------
+
+            parquet_file = pq.ParquetFile(parquet_path)
+
+            parquet_rows = parquet_file.metadata.num_rows
+            parquet_schema = parquet_file.schema_arrow
+
+            report["quality_checks"] = {
+                "both_datasets_processed": (
+                    len(report["datasets"]) == len(DATASETS)
+                ),
+                "all_records_written": (
+                    report["total_records_read"]
+                    == report["total_records_written"]
+                ),
+                "zero_rejected_records": (
+                    report["total_records_rejected"] == 0
+                ),
+                "non_empty_output": parquet_rows > 0,
+                "parquet_row_count_matches": (
+                    parquet_rows == report["total_records_written"]
+                ),
+                "parquet_schema_matches": (
+                    parquet_schema.equals(SCHEMA)
+                ),
+            }
+
+            failed_checks = [
+                name
+                for name, passed in report["quality_checks"].items()
+                if not passed
+            ]
+
+            if failed_checks:
+                raise RuntimeError(
+                    "Transformation quality checks failed: "
+                    + ", ".join(failed_checks)
+                )
+
+            # ------------------------------------------------
+            # Publish only after all checks succeed
+            # ------------------------------------------------
+
+            output_blob = bucket.blob(output_object)
+
+            output_blob.upload_from_filename(
+                str(parquet_path),
+                content_type="application/vnd.apache.parquet",
+                checksum="auto",
+            )
+
+            transformation_succeeded = True
+            report["status"] = "success"
+            report["output_size_bytes"] = parquet_path.stat().st_size
+            report["output_rows"] = parquet_rows
 
             logger.info(
-                "Looking up metadata for %s",
-                settings["file"]
+                "Parquet uploaded: gs://%s/%s",
+                bucket_name,
+                output_object,
             )
-
-            snapshot_date = get_snapshot_date(
-                settings["file"]
-            )
-
-            dataset_report = process_dataset(
-                writer=writer,
-                settings=settings,
-                snapshot_date=snapshot_date,
-                ingested_at=ingested_at,
-                report=report,
-            )
-
-            report["total_records_read"] += (
-                dataset_report["records_read"]
-            )
-
-            report["total_records_written"] += (
-                dataset_report["records_written"]
-            )
-
-            report["total_records_rejected"] += (
-                dataset_report["records_rejected"]
-            )
-
-        # ----------------------------------------------------
-        # Close Parquet writer
-        # ----------------------------------------------------
-
-        writer.close()
-        writer = None
-
-        # ----------------------------------------------------
-        # Fail if any records were rejected.
-        # Keep the previous successful output untouched.
-        # ----------------------------------------------------
-
-        if report["total_records_rejected"] > 0:
-
-            raise RuntimeError(
-                f"Transformation rejected "
-                f"{report['total_records_rejected']} record(s). "
-                f"Review the transformation report before publishing."
-            )
-
-        # ----------------------------------------------------
-        # Check that output contains records
-        # ----------------------------------------------------
-
-        if report["total_records_written"] == 0:
-
-            raise RuntimeError(
-                "No records were written. "
-                "The input JSON files may be empty or have an "
-                "unexpected structure."
-            )
-
-        # ----------------------------------------------------
-        # Publish the completed Parquet file
-        # ----------------------------------------------------
-
-        TEMP_OUTPUT_FILE.replace(OUTPUT_FILE)
-
-        transformation_succeeded = True
-        report["status"] = "success"
-
-        logger.info("----------------------------------")
-        logger.info("Transformation completed successfully.")
-        logger.info("Output: %s", OUTPUT_FILE)
 
     except Exception as error:
 
@@ -829,35 +965,40 @@ def main():
 
     finally:
 
-        # Close writer if an exception occurred during processing.
         if writer is not None:
-
             try:
                 writer.close()
-
             except Exception:
                 logger.exception(
                     "Error while closing Parquet writer."
                 )
 
-        # Remove incomplete temporary output.
-        if TEMP_OUTPUT_FILE.exists():
-
+        if quality_connection is not None:
             try:
-                TEMP_OUTPUT_FILE.unlink()
-
-            except OSError:
+                quality_connection.close()
+            except Exception:
                 logger.exception(
-                    "Could not remove temporary Parquet file."
+                    "Error while closing quality database."
                 )
 
-        # Write final report.
+        report["completed_at_utc"] = utc_now().isoformat()
+
         try:
-            write_report(report)
+            write_report(
+                bucket,
+                report_object,
+                report,
+            )
+
+            logger.info(
+                "Transformation report: gs://%s/%s",
+                bucket_name,
+                report_object,
+            )
 
         except Exception:
             logger.exception(
-                "Could not write transformation report."
+                "Could not upload transformation report."
             )
 
         # ----------------------------------------------------
@@ -867,30 +1008,25 @@ def main():
         logger.info("----------------------------------")
         logger.info("TRANSFORMATION SUMMARY")
         logger.info("----------------------------------")
-
         logger.info("Status: %s", report["status"])
-
         logger.info(
             "Records read: %s",
-            report["total_records_read"]
+            f"{report['total_records_read']:,}",
         )
-
         logger.info(
             "Records written: %s",
-            report["total_records_written"]
+            f"{report['total_records_written']:,}",
+        )
+        logger.info(
+            "Records rejected: %s",
+            f"{report['total_records_rejected']:,}",
         )
 
         logger.info(
-            "Records rejected: %s",
-            report["total_records_rejected"]
+            "Output: gs://%s/%s",
+            bucket_name,
+            output_object,
         )
-
-        logger.info("Report: %s", REPORT_FILE)
-
-        if not transformation_succeeded:
-            logger.error(
-                "Transformation did not publish a new output file."
-            )
 
         logger.info("----------------------------------")
 
@@ -898,7 +1034,7 @@ def main():
 
 
 # ============================================================
-# 11. SCRIPT ENTRY POINT
+# 12. SCRIPT ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":

@@ -1,0 +1,11 @@
+DEBUG: Running [gcloud.services.enable] with arguments: [--project: "godaddy-auctions-inventory-v11", --verbosity: "debug", SERVICE:1: "['artifactregistry.googleapis.com']"]
+DEBUG: On GCE from memory cache: False
+DEBUG: On GCE from memory cache: False
+DEBUG: Starting new HTTPS connection (1): serviceusage.googleapis.com:443
+DEBUG: https://serviceusage.googleapis.com:443 "POST /v1/projects/godaddy-auctions-inventory-v11/services/artifactregistry.googleapis.com:enable?alt=json HTTP/1.1" 200 None
+DEBUG: On GCE from memory cache: False
+DEBUG: Starting new HTTPS connection (1): serviceusage.googleapis.com:443
+DEBUG: https://serviceusage.googleapis.com:443 "GET /v1/operations/acat.p2-49757842710-e89a5217-5950-4cb3-935f-9abe731e96ab?alt=json HTTP/1.1" 200 None
+Operation "operations/acat.p2-49757842710-e89a5217-5950-4cb3-935f-9abe731e96ab" finished successfully.
+DEBUG: Chosen display Format:none
+INFO: Display format: "none"

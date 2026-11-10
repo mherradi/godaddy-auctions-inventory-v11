@@ -1,0 +1,65 @@
+
+version: 2
+
+models:
+  - name: int_auction_inventory
+    description: >
+      Intermediate domain inventory enriched with domain characteristics,
+      keyword matching, and auction indicators.
+
+    columns:
+      - name: listing_id
+        description: Unique auction listing identifier.
+        data_tests:
+          - not_null
+          - unique
+
+      - name: domain
+        data_tests:
+          - not_null
+
+      - name: name
+        description: Domain name without its extension.
+        data_tests:
+          - not_null
+
+      - name: extension
+        description: Domain extension identified using the suffix reference.
+        data_tests:
+          - not_null
+
+      - name: type
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['Bid', 'Buy']
+
+      - name: keyword_in
+        description: True when at least one reference keyword matches.
+        data_tests:
+          - not_null
+
+      - name: pure_letter
+        data_tests:
+          - not_null
+
+      - name: with_num
+        data_tests:
+          - not_null
+
+      - name: hyphenated
+        data_tests:
+          - not_null
+
+      - name: has_valuation
+        data_tests:
+          - not_null
+
+      - name: has_bids
+        data_tests:
+          - not_null
+
+      - name: ending_today
+        data_tests:
+          - not_null

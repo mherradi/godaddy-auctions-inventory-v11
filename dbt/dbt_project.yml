@@ -1,0 +1,34 @@
+name: 'godaddy_auctions_dbt'
+version: '1.1.0'
+config-version: 2
+
+profile: 'godaddy_auctions_dbt'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  godaddy_auctions_dbt:
+    staging:
+      godaddy:
+        +schema: godaddy_auctions_dbt
+        +materialized: view
+    intermediate:
+      +schema: godaddy_auctions_dbt
+      +materialized: view
+    marts:
+      +schema: godaddy_auctions_dbt
+      +materialized: table
+
+seeds:
+  godaddy_auctions_dbt:
+    +schema: godaddy_auctions_dbt
+    +quote_columns: false

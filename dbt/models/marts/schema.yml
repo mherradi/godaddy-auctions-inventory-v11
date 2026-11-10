@@ -1,0 +1,118 @@
+
+version: 2
+
+models:
+  - name: mart_auction_inventory
+    description: >
+      Central analytical mart containing the complete standardized
+      auction inventory, enriched with domain characteristics.
+
+    columns:
+      - name: listing_id
+        description: Unique auction listing identifier.
+        data_tests:
+          - not_null
+          - unique
+
+      - name: domain
+        description: Complete domain name.
+        data_tests:
+          - not_null
+
+      - name: name
+        description: Domain name excluding its extension.
+        data_tests:
+          - not_null
+
+      - name: extension
+        description: Domain extension.
+        data_tests:
+          - not_null
+
+      - name: snapshot_date
+        description: Date on which the inventory was collected.
+        data_tests:
+          - not_null
+
+  - name: mart_auction_daily_summary
+    description: >
+      Aggregated inventory snapshot metrics grouped by snapshot date,
+      auction type, and domain extension.
+
+    columns:
+      - name: snapshot_date
+        description: Inventory collection date.
+        data_tests:
+          - not_null
+
+      - name: type
+        description: Auction type, Bid or Buy.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['Bid', 'Buy']
+
+      - name: extension
+        description: Domain extension.
+        data_tests:
+          - not_null
+
+      - name: total_listings
+        description: Number of listings in the group.
+        data_tests:
+          - not_null
+
+      - name: average_price
+        description: Average listing price.
+        data_tests:
+          - not_null
+
+  - name: mart_four_letters_domains
+    description: >
+      Auction listings whose domain name contains exactly four characters,
+      excluding the extension.
+
+    columns:
+      - name: listing_id
+        data_tests:
+          - not_null
+          - unique
+
+      - name: length
+        description: Domain name length, excluding extension.
+        data_tests:
+          - not_null
+
+  - name: mart_five_letters_domains
+    description: >
+      Auction listings whose domain name contains exactly five characters,
+      excluding the extension.
+
+    columns:
+      - name: listing_id
+        data_tests:
+          - not_null
+          - unique
+
+      - name: length
+        description: Domain name length, excluding extension.
+        data_tests:
+          - not_null
+
+  - name: mart_two_keywords_domains
+    description: >
+      V1.0 analytical segment containing domain names between 7 and 12
+      characters long, inclusive, excluding the extension. Length is used
+      as a practical proxy and does not represent an actual keyword count.
+
+    columns:
+      - name: listing_id
+        data_tests:
+          - not_null
+          - unique
+
+      - name: length
+        description: Domain name length, excluding extension.
+        data_tests:
+          - not_null

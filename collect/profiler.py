@@ -1,6 +1,6 @@
 
 """
-Profile GoDaddy auction inventory JSON files.
+Profile GoDaddy auction inventory JSON files stored in GCS.
 
 Features:
 - Streaming JSON parsing
@@ -12,41 +12,36 @@ Features:
 - Cross-dataset domain overlap
 
 Run from the project root:
-    python -m collect.profiler
+    python -m collect.profiler --snapshot-date YYYY-MM-DD
 """
 
+import argparse
 import json
 import logging
-import os
 import sqlite3
 import tempfile
 
 from collections import Counter
 from decimal import Decimal
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import ijson
+import yaml
+from google.cloud import storage
 
-from datetime import datetime, timezone
 
 # --------------------------------------------------
 # Configuration
 # --------------------------------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-DATA_DIR = PROJECT_ROOT / "data" / "processed"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
 DATASETS = {
-    "all_biddable_auctions": (
-        DATA_DIR / "all_biddable_auctions.json"
-    ),
-    "closeout_listings": (
-        DATA_DIR / "closeout_listings.json"
-    ),
+    "all_biddable_auctions": "all_biddable_auctions.json",
+    "closeout_listings": "closeout_listings.json",
 }
-
-REPORT_PATH = DATA_DIR / "profiling_report.json"
 
 SAMPLE_LIMIT = 3
 BATCH_SIZE = 5000
@@ -65,7 +60,31 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------
-# Helpers
+# Configuration helpers
+# --------------------------------------------------
+
+def load_config():
+    """Load project configuration."""
+
+    with CONFIG_PATH.open("r", encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+
+    if not isinstance(config, dict):
+        raise ValueError(
+            "Configuration file must contain a YAML mapping."
+        )
+
+    return config
+
+
+def utc_now():
+    """Return the current UTC timestamp."""
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+# --------------------------------------------------
+# JSON helpers
 # --------------------------------------------------
 
 def classify_type(value):
@@ -74,8 +93,7 @@ def classify_type(value):
     if value is None:
         return "null"
 
-    # bool must be checked before int because bool is
-    # a subclass of int in Python.
+    # bool must be checked before int.
     if isinstance(value, bool):
         return "boolean"
 
@@ -98,7 +116,7 @@ def classify_type(value):
 
 
 def make_json_safe(value):
-    """Convert values such as Decimal into JSON-safe values."""
+    """Convert Decimal and nested values into JSON-safe values."""
 
     if isinstance(value, Decimal):
         return str(value)
@@ -110,23 +128,22 @@ def make_json_safe(value):
         }
 
     if isinstance(value, list):
-        return [make_json_safe(item) for item in value]
+        return [
+            make_json_safe(item)
+            for item in value
+        ]
 
     return value
 
 
-def create_domain_database():
+# --------------------------------------------------
+# Temporary SQLite database
+# --------------------------------------------------
+
+def create_domain_database(temporary_dir):
     """Create temporary SQLite storage for domain comparisons."""
 
-    handle = tempfile.NamedTemporaryFile(
-        prefix="godaddy_domains_",
-        suffix=".sqlite",
-        dir=DATA_DIR,
-        delete=False,
-    )
-
-    db_path = Path(handle.name)
-    handle.close()
+    db_path = Path(temporary_dir) / "domain_analysis.sqlite"
 
     connection = sqlite3.connect(db_path)
 
@@ -143,7 +160,7 @@ def create_domain_database():
 
 
 def flush_domain_batch(connection, dataset_name, domains):
-    """Insert a batch of domains into SQLite."""
+    """Insert a batch of domain names into SQLite."""
 
     if not domains:
         return
@@ -177,15 +194,22 @@ def flush_domain_batch(connection, dataset_name, domains):
 # Dataset profiling
 # --------------------------------------------------
 
-def profile_dataset(dataset_name, file_path, connection):
-    """Stream and profile one GoDaddy dataset."""
+def profile_dataset(
+    dataset_name,
+    file_path,
+    connection,
+):
+    """Stream and profile one GoDaddy JSON dataset."""
 
     if not file_path.exists():
         raise FileNotFoundError(
             f"Dataset not found: {file_path}"
         )
 
-    logger.info("Profiling dataset: %s", dataset_name)
+    logger.info(
+        "Profiling dataset: %s",
+        dataset_name,
+    )
 
     field_stats = {}
     auction_types = Counter()
@@ -208,6 +232,7 @@ def profile_dataset(dataset_name, file_path, connection):
 
             record_count += 1
 
+            # Profile fields.
             for field_name, value in record.items():
 
                 if field_name not in field_stats:
@@ -238,7 +263,7 @@ def profile_dataset(dataset_name, file_path, connection):
                         make_json_safe(value)
                     )
 
-                # Calculate statistics only for native JSON numbers.
+                # Calculate statistics for native JSON numbers.
                 if (
                     isinstance(value, (int, float, Decimal))
                     and not isinstance(value, bool)
@@ -251,11 +276,13 @@ def profile_dataset(dataset_name, file_path, connection):
                     if stats["numeric_min"] is None:
                         stats["numeric_min"] = numeric_value
                         stats["numeric_max"] = numeric_value
+
                     else:
                         stats["numeric_min"] = min(
                             stats["numeric_min"],
                             numeric_value,
                         )
+
                         stats["numeric_max"] = max(
                             stats["numeric_max"],
                             numeric_value,
@@ -410,7 +437,8 @@ def analyze_domains(connection):
         "cross_dataset_overlap": {
             "common_unique_domain_count": overlap,
             "sample_common_domains": [
-                row[0] for row in common_samples
+                row[0]
+                for row in common_samples
             ],
         },
     }
@@ -422,66 +450,147 @@ def analyze_domains(connection):
 
 def main():
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(
+        description="Profile GoDaddy inventory datasets stored in GCS."
+    )
 
-    connection = None
-    database_path = None
+    parser.add_argument(
+        "--snapshot-date",
+        default=datetime.now(timezone.utc).date().isoformat(),
+        help="Snapshot date in YYYY-MM-DD format.",
+    )
+
+    args = parser.parse_args()
+
+    snapshot_date = date.fromisoformat(
+        args.snapshot_date
+    ).isoformat()
+
+    config = load_config()
+    storage_config = config["storage"]
+
+    bucket_name = storage_config["bucket"]
+
+    processed_prefix = storage_config.get(
+        "processed_prefix",
+        "processed/snapshots",
+    ).strip("/")
+
+    snapshot_prefix = (
+        f"{processed_prefix}/{snapshot_date}"
+    )
+
+    report_object = (
+        f"{snapshot_prefix}/profiling_report.json"
+    )
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
 
     dataset_reports = {}
     failures = []
+    domain_report = None
 
-    try:
-        connection, database_path = create_domain_database()
+    # Temporary storage is used only during this profiling run.
+    with tempfile.TemporaryDirectory(
+        prefix="godaddy_profiler_"
+    ) as temporary_dir:
 
-        for dataset_name, file_path in DATASETS.items():
+        connection = None
 
-            try:
-                dataset_reports[dataset_name] = profile_dataset(
-                    dataset_name,
-                    file_path,
-                    connection,
+        try:
+            connection, database_path = create_domain_database(
+                temporary_dir
+            )
+
+            for dataset_name, filename in DATASETS.items():
+
+                source_object = (
+                    f"{snapshot_prefix}/{filename}"
                 )
 
-            except Exception as error:
-                logger.exception(
-                    "Profiling failed for %s",
-                    dataset_name,
-                )
+                try:
+                    blob = bucket.get_blob(source_object)
 
-                failures.append({
-                    "dataset": dataset_name,
-                    "error": str(error),
-                })
+                    if blob is None:
+                        raise FileNotFoundError(
+                            f"Dataset not found: "
+                            f"gs://{bucket_name}/{source_object}"
+                        )
 
-        domain_report = None
+                    local_path = (
+                        Path(temporary_dir) / filename
+                    )
 
-        # Compare domains only when both datasets were profiled.
-        if len(dataset_reports) == len(DATASETS):
-            domain_report = analyze_domains(connection)
+                    logger.info(
+                        "Downloading dataset from GCS: %s",
+                        source_object,
+                    )
 
-    finally:
-        if connection is not None:
-            connection.close()
+                    blob.download_to_filename(
+                        str(local_path)
+                    )
 
-        if database_path is not None and database_path.exists():
-            os.remove(database_path)
+                    logger.info(
+                        "Downloaded %s (%s bytes)",
+                        filename,
+                        local_path.stat().st_size,
+                    )
 
+                    dataset_reports[dataset_name] = profile_dataset(
+                        dataset_name,
+                        local_path,
+                        connection,
+                    )
+
+                except Exception as error:
+
+                    logger.exception(
+                        "Profiling failed for %s",
+                        dataset_name,
+                    )
+
+                    failures.append({
+                        "dataset": dataset_name,
+                        "error": str(error),
+                    })
+
+            # Compare domains only when both datasets were profiled.
+            if len(dataset_reports) == len(DATASETS):
+                domain_report = analyze_domains(connection)
+
+        finally:
+            if connection is not None:
+                connection.close()
+
+    # Build the profiling report.
     report = {
         "source": "godaddy",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "snapshot_date": snapshot_date,
+        "generated_at": utc_now(),
         "datasets": dataset_reports,
         "domain_analysis": domain_report,
         "failures": failures,
-        "status": "success" if not failures else "partial_failure",
+        "status": (
+            "success"
+            if not failures
+            else "partial_failure"
+        ),
     }
 
-    temporary_report = REPORT_PATH.with_suffix(".json.tmp")
+    # Upload profiling report to GCS.
+    report_blob = bucket.blob(report_object)
 
-    with temporary_report.open("w", encoding="utf-8") as file:
-        json.dump(report, file, indent=4, ensure_ascii=False)
+    report_blob.upload_from_string(
+        json.dumps(
+            report,
+            indent=4,
+            ensure_ascii=False,
+        ),
+        content_type="application/json",
+    )
 
-    os.replace(temporary_report, REPORT_PATH)
-
+    # Summary.
     logger.info("----------------------------------")
     logger.info("PROFILING SUMMARY")
 
@@ -493,8 +602,17 @@ def main():
             result["field_count"],
         )
 
-    logger.info("Failed datasets: %d", len(failures))
-    logger.info("Report saved: %s", REPORT_PATH)
+    logger.info(
+        "Failed datasets: %d",
+        len(failures),
+    )
+
+    logger.info(
+        "Report: gs://%s/%s",
+        bucket_name,
+        report_object,
+    )
+
     logger.info("----------------------------------")
 
     if failures:
@@ -502,4 +620,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.exception("Profiler pipeline failed.")
+        raise SystemExit(1)

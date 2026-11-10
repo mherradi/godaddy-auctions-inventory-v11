@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: godaddy
+    description: "Raw GoDaddy Auctions inventory loaded into BigQuery."
+    database: godaddy-auctions-inventory-v11
+    schema: godaddy_auctions
+    tables:
+      - name: auction_inventory
+        description: "Standardized GoDaddy auction inventory loaded from Parquet."
